@@ -275,25 +275,130 @@ class GenericDomains extends RegistrarModule
     }
 
     /**
-     * Verifies that the provided domain name is available
-     *
-     * @param string $domain The domain to lookup
-     * @param int $module_row_id The ID of the module row to fetch for the current module
-     * @return bool True if the domain is available, false otherwise
-     */
+    * Verifies that the provided domain name is available by querying Google's DNS-over-HTTPS service
+    * A domain is considered unavailable if it has NS or A records or doesn't return NXDOMAIN
+    *
+    * @param string $domain The domain to lookup
+    * @param int $module_row_id The ID of the module row to fetch for the current module
+    * @return bool True if the domain is available, false otherwise
+    */
     public function checkAvailability($domain, $module_row_id = null)
     {
-        if (class_exists('\Iodev\Whois\Factory')) {
-            $whois = \Iodev\Whois\Factory::get()->createWhois();
-
+        // Sanitize domain input
+        $domain = trim($domain);
+        
+        // Try Google's DNS-over-HTTPS service first
+        $available = $this->checkDomainWithGoogleDoh($domain);
+        
+        // Fallback to WHOIS lookup if the DoH method fails or class exists
+        if ($available === null && class_exists('\Iodev\Whois\Factory')) {
             try {
+                $whois = \Iodev\Whois\Factory::get()->createWhois();
                 return $whois->isDomainAvailable($domain);
             } catch (Exception $e) {
+                // Log the exception if a logger is available
+                if (method_exists($this, 'logger')) {
+                    $this->logger->error('WHOIS lookup failed: ' . $e->getMessage());
+                }
+                // Default to true if both lookups fail to avoid blocking legitimate registrations
                 return true;
             }
         }
+        
+        // Return result from DoH check or default to true
+        return $available !== null ? $available : true;
+    }
 
-        return true;
+    /**
+    * Checks domain availability using Google's DNS-over-HTTPS service
+    * 
+    * @param string $domain The domain to lookup
+    * @return bool|null True if domain is available, false if taken, null on lookup failure
+    */
+    private function checkDomainWithGoogleDoh($domain)
+    {
+        // Google DoH endpoint
+        $googleDoh = 'https://dns.google/resolve';
+        
+        try {
+            // Check for NS records first (authoritative nameservers)
+            $nsParams = [
+                'name' => $domain,
+                'type' => 'NS'
+            ];
+            $nsResult = $this->performDnsQuery($googleDoh, $nsParams);
+            
+            // If we find NS records, domain is definitely not available
+            if (isset($nsResult['Status']) && $nsResult['Status'] === 0 && !empty($nsResult['Answer'])) {
+                return false;
+            }
+            
+            // Check for A records (IP addresses)
+            $aParams = [
+                'name' => $domain,
+                'type' => 'A'
+            ];
+            $aResult = $this->performDnsQuery($googleDoh, $aParams);
+            
+            // If we find A records, domain is not available
+            if (isset($aResult['Status']) && $aResult['Status'] === 0 && !empty($aResult['Answer'])) {
+                return false;
+            }
+            
+            // Check the status code - 3 means NXDOMAIN (domain doesn't exist)
+            if (isset($nsResult['Status']) && $nsResult['Status'] === 3) {
+                // NXDOMAIN means the domain is likely available
+                return true;
+            }
+            
+            // If we get here with Status 0 but no records, domain might exist but have no records
+            // Consider it unavailable to be safe
+            if (isset($nsResult['Status']) && $nsResult['Status'] === 0) {
+                return false;
+            }
+            
+            // Inconclusive result
+            return null;
+            
+        } catch (Exception $e) {
+            // Log the exception if a logger is available
+            if (method_exists($this, 'logger')) {
+                $this->logger->error('Google DoH lookup failed: ' . $e->getMessage());
+            }
+            return null;
+        }
+    }
+
+    /**
+    * Performs a DNS query via DoH
+    * 
+    * @param string $endpoint The DoH endpoint URL
+    * @param array $params Query parameters
+    * @return array|null Decoded JSON response or null on failure
+    */
+    private function performDnsQuery($endpoint, $params)
+    {
+        $url = $endpoint . '?' . http_build_query($params);
+        
+        $options = [
+            'http' => [
+                'method' => 'GET',
+                'header' => [
+                    'Accept: application/dns-json',
+                    'User-Agent: Generic-Domains-Module'
+                ],
+                'timeout' => 5
+            ]
+        ];
+        
+        $context = stream_context_create($options);
+        $response = @file_get_contents($url, false, $context);
+        
+        if ($response === false) {
+            return null;
+        }
+        
+        return json_decode($response, true);
     }
 
     /**
